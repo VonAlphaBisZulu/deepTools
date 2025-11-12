@@ -126,8 +126,9 @@ or
         'sort',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         parents=[sortArgs()],
-        help='Sort a matrix file to correspond to the order of entries in the desired input file(s). The groups of regions designated by the files must be present in the order found in the output of computeMatrix (otherwise, use the subset command first). Note that this subcommand can also be used to remove unwanted regions, since regions not present in the input file(s) will be omitted from the output.',
-        usage='Example usage:\n  computeMatrixOperations sort -m input.mat.gz -R regions1.bed regions2.bed regions3.gtf -o input.sorted.mat.gz\n\n')
+        help='Sort a matrix file. There are two sorting modes: (1) Sort to match the order of entries in input BED/GTF file(s) using --regionsFileName, or (2) Sort based on signal values using --sortRegions with optional --sortUsing and --sortUsingSamples parameters. These two modes are mutually exclusive.',
+        usage='Example usage:\n  computeMatrixOperations sort -m input.mat.gz -R regions1.bed -o sorted.mat.gz\n'
+              '  computeMatrixOperations sort -m input.mat.gz --sortRegions descend --sortUsing mean -o sorted.mat.gz\n\n')
 
     # dataRange
     subparsers.add_parser(
@@ -262,20 +263,49 @@ def sortArgs():
                           help='Output file name',
                           required=True)
 
-    required.add_argument('--regionsFileName', '-R',
-                          help='File name(s), in BED or GTF format, containing the regions. '
-                               'If multiple bed files are given, each one is '
-                               'considered a group that can be plotted separately. '
-                               'Also, adding a "#" symbol in the bed file causes all '
-                               'the regions until the previous "#" to be considered '
-                               'one group. Alternatively for BED files, putting '
-                               'deepTools_group in the header can be used to indicate a '
-                               'column with group labels. Note that these should be '
-                               'sorted such that all group entries are together.',
-                          required=True,
-                          nargs='+')
-
     optional = parser.add_argument_group('Optional arguments')
+
+    # Mutually exclusive group for sorting methods
+    sort_group = optional.add_mutually_exclusive_group()
+
+    sort_group.add_argument('--regionsFileName', '-R',
+                            help='File name(s), in BED or GTF format, containing the regions. '
+                                 'If multiple bed files are given, each one is '
+                                 'considered a group that can be plotted separately. '
+                                 'Also, adding a "#" symbol in the bed file causes all '
+                                 'the regions until the previous "#" to be considered '
+                                 'one group. Alternatively for BED files, putting '
+                                 'deepTools_group in the header can be used to indicate a '
+                                 'column with group labels. Note that these should be '
+                                 'sorted such that all group entries are together. '
+                                 'This option is mutually exclusive with --sortRegions.',
+                            nargs='+')
+
+    sort_group.add_argument('--sortRegions',
+                            help='Whether the output file should present the '
+                            'regions sorted. The default is to not sort the regions. '
+                            'Note that "cluster" is not yet fully implemented and will '
+                            'raise an error if used. '
+                            'This option is mutually exclusive with --regionsFileName.',
+                            choices=["descend", "ascend", "cluster"],
+                            default=None)
+
+    optional.add_argument('--sortUsing',
+                          help='Indicate which method should be used for '
+                          'sorting. The value is computed for each row. '
+                          'Note that the region_length option will lead '
+                          'to a dotted line within the heatmap that indicates '
+                          'the end of the regions. (Default: %(default)s)',
+                          choices=["mean", "median", "max", "min", "sum",
+                                   "region_length"],
+                          default='mean')
+
+    optional.add_argument('--sortUsingSamples',
+                          help='List of sample numbers (order as in matrix), '
+                          'that are used for sorting by --sortUsing. '
+                          'If no value is provided, all samples are used. '
+                          'Example: --sortUsingSamples 1 3',
+                          type=int, nargs='+')
 
     optional.add_argument('--transcriptID',
                           default='transcript',
@@ -688,6 +718,73 @@ def loadGTF(line, fp, fname, labels, regions, transcriptID, transcript_id_design
                 regions[labelIdx][name] = len(regions[labelIdx])
 
 
+def sortMatrixBySamples(hm, sortRegions, sortUsing='mean', sortUsingSamples=None):
+    """
+    Sort matrix based on sample values, similar to computeMatrix --sortRegions.
+
+    This function sorts the matrix rows within each group based on the values
+    computed from the specified samples using the specified method.
+
+    Parameters
+    ----------
+    hm : heatmapper object
+        The heatmapper object containing the matrix to sort
+    sortRegions : str
+        Sort order: 'descend', 'ascend', or 'cluster'
+    sortUsing : str
+        Method to compute sorting values: 'mean', 'median', 'max', 'min', 'sum', 'region_length'
+    sortUsingSamples : list of int
+        1-based sample indices to use for sorting. If None, all samples are used.
+    """
+    if sortRegions == 'cluster':
+        sys.exit("Error: The 'cluster' sorting option is not yet implemented.\n"
+                 "Please use 'descend' or 'ascend' instead.\n")
+
+    # Convert 1-based sample indices to 0-based if provided
+    sample_list = None
+    if sortUsingSamples is not None:
+        sample_list = []
+        for i in sortUsingSamples:
+            if i > 0 and i <= hm.matrix.get_num_samples():
+                sample_list.append(i - 1)
+            else:
+                sys.exit("Error: The value {} for --sortUsingSamples is not valid. "
+                         "Only values from 1 to {} are allowed.\n".format(i, hm.matrix.get_num_samples()))
+        print('Samples used for sorting: ', [x + 1 for x in sample_list])
+
+    # Check if all groups have the same number of regions
+    group_sizes = [hm.matrix.group_boundaries[i+1] - hm.matrix.group_boundaries[i]
+                   for i in range(len(hm.matrix.group_labels))]
+
+    if len(set(group_sizes)) == 1 and len(group_sizes) > 1:
+        # All groups have the same number of regions
+        print("All groups have the same number of regions ({}). Using global sorting across all groups.".format(group_sizes[0]))
+
+        # Perform global sorting by temporarily merging groups
+        # Save original group information
+        original_boundaries = hm.matrix.group_boundaries.copy()
+        original_labels = hm.matrix.group_labels.copy()
+
+        # Temporarily merge all groups into one for sorting
+        hm.matrix.group_boundaries = [0, len(hm.matrix.regions)]
+        hm.matrix.group_labels = ['all_regions']
+
+        # Sort using the matrix sort_groups method
+        hm.matrix.sort_groups(sort_using=sortUsing, sort_method=sortRegions, sample_list=sample_list)
+
+        # Restore original group boundaries and labels
+        hm.matrix.group_boundaries = original_boundaries
+        hm.matrix.group_labels = original_labels
+    else:
+        # Groups have different numbers of regions, sort each group independently
+        print("Groups have different numbers of regions. Sorting each group independently.")
+        hm.matrix.sort_groups(sort_using=sortUsing, sort_method=sortRegions, sample_list=sample_list)
+
+    # Update parameters
+    hm.parameters['sort regions'] = sortRegions
+    hm.parameters['sort using'] = sortUsing
+
+
 def sortMatrix(hm, regionsFileName, transcriptID, transcript_id_designator, verbose=True):
     """
     Iterate through the files noted by regionsFileName and sort hm accordingly
@@ -843,7 +940,14 @@ def main(args=None):
         cbindMatrices(hm, args)
         hm.save_matrix(args.outFileName)
     elif args.command == 'sort':
-        sortMatrix(hm, args.regionsFileName, args.transcriptID, args.transcript_id_designator)
+        if args.regionsFileName is not None:
+            # Sort using BED file
+            sortMatrix(hm, args.regionsFileName, args.transcriptID, args.transcript_id_designator)
+        elif args.sortRegions is not None:
+            # Sort using sample values
+            sortMatrixBySamples(hm, args.sortRegions, args.sortUsing, args.sortUsingSamples)
+        else:
+            sys.exit("Error: Either --regionsFileName (-R) or --sortRegions must be specified.\n")
         hm.save_matrix(args.outFileName)
     elif args.command == 'relabel':
         relabelMatrix(hm, args)
